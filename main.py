@@ -12,14 +12,14 @@ from datetime import date, timedelta
 import pandas as pd
 import argparse
 import shutil
-from typing import List, Optional
+from typing import List, Optional, Dict
 
 # ===============================
 # 設定
 # ===============================
 SCOPES = [
     "https://www.googleapis.com/auth/yt-analytics.readonly",
-    "https://www.googleapis.com/auth/youtube.readonly",  # Data API で動画ID取得時に必要
+    "https://www.googleapis.com/auth/youtube.readonly",  # Data API で動画タイトル/ID取得に必要
 ]
 
 START_DATE_DEFAULT = (date.today() - timedelta(days=90)).isoformat()
@@ -40,8 +40,7 @@ DEFAULT_METRICS = (
 
 # よくある別名→正規名称のマッピング
 METRIC_ALIASES = {
-    # 誤記/別名 -> 正式名
-    "watchTime": "estimatedMinutesWatched",   # よく混同される
+    "watchTime": "estimatedMinutesWatched",
     "avgViewDuration": "averageViewDuration",
     "avg_view_duration": "averageViewDuration",
     "estimated_watch_time_minutes": "estimatedMinutesWatched",
@@ -121,7 +120,7 @@ def zip_out_dir():
 
 
 # ===============================
-# Data API: 動画ID取得
+# Data API: 動画ID/タイトル取得
 # ===============================
 def parse_channel_id_from_ids(ids: str) -> Optional[str]:
     if not ids:
@@ -188,6 +187,28 @@ def get_all_video_ids(youtube, ids: str) -> List[str]:
     return get_video_ids_from_uploads(youtube, uploads_playlist_id)
 
 
+def chunked(lst: List[str], size: int) -> List[List[str]]:
+    return [lst[i:i + size] for i in range(0, len(lst), size)]
+
+
+def get_video_title_map(youtube, video_ids: List[str]) -> Dict[str, str]:
+    """
+    videos.list(part=snippet) を使って videoId -> title の辞書を返す。
+    """
+    title_map: Dict[str, str] = {}
+    for chunk in chunked(video_ids, 50):  # APIの上限に合わせて分割
+        resp = youtube.videos().list(
+            part="snippet",
+            id=",".join(chunk),
+            maxResults=50
+        ).execute()
+        for item in resp.get("items", []):
+            vid = item["id"]
+            title = item.get("snippet", {}).get("title", "")
+            title_map[vid] = title
+    return title_map
+
+
 # ===============================
 # Analytics API ヘルパー
 # ===============================
@@ -232,15 +253,12 @@ def _sanitize_sort_for_day_only(sort: Optional[str]) -> str:
 
 
 def sanitize_metrics(metrics: str) -> str:
-    """
-    入力メトリクス文字列に対し、別名を正規名称へ変換し、重複・空白を除去。
-    """
     cleaned: List[str] = []
     for raw in metrics.split(","):
         m = raw.strip()
         if not m:
             continue
-        m = METRIC_ALIASES.get(m, m)  # 別名→正規名
+        m = METRIC_ALIASES.get(m, m)
         if m not in cleaned:
             cleaned.append(m)
     return ",".join(cleaned)
@@ -252,6 +270,13 @@ def sanitize_metrics(metrics: str) -> str:
 def videos_daily_via_loop(yta, youtube, *, ids, startDate, endDate, metrics, sort=None) -> pd.DataFrame:
     video_ids = get_all_video_ids(youtube, ids)
     print(f"動画IDを {len(video_ids)} 件取得しました。日別×動画で集計します…")
+
+    # タイトルを一括取得
+    title_map = {}
+    try:
+        title_map = get_video_title_map(youtube, video_ids)
+    except Exception as e:
+        print(f"[WARN] タイトル取得に失敗しました（継続します）。詳細: {e}")
 
     safe_sort = _sanitize_sort_for_day_only(sort)
     dfs = []
@@ -268,6 +293,7 @@ def videos_daily_via_loop(yta, youtube, *, ids, startDate, endDate, metrics, sor
         )
         if not df.empty:
             df.insert(0, "videoId", vid)
+            df.insert(1, "videoTitle", title_map.get(vid, ""))  # ← タイトル列
             dfs.append(df)
         if i % 50 == 0:
             print(f"  {i} / {len(video_ids)} 本処理…")
@@ -275,15 +301,17 @@ def videos_daily_via_loop(yta, youtube, *, ids, startDate, endDate, metrics, sor
     if dfs:
         merged = pd.concat(dfs, ignore_index=True)
         cols = list(merged.columns)
-        if "day" in cols:
-            cols.remove("day")
-            merged = merged[["videoId", "day"] + [c for c in cols if c not in ("videoId", "day")]]
+        # videoId, videoTitle, day を先頭に整える
+        for k in ["videoId", "videoTitle", "day"]:
+            if k in cols:
+                cols.remove(k)
+        merged = merged[["videoId", "videoTitle", "day"] + cols]
         return merged
     else:
-        return pd.DataFrame(columns=["videoId", "day"] + [m.strip() for m in metrics.split(",")])
+        return pd.DataFrame(columns=["videoId", "videoTitle", "day"] + [m.strip() for m in metrics.split(",")])
 
 
-def videos_daily_via_analytics_only(yta, *, ids, startDate, endDate, metrics, sort=None) -> pd.DataFrame:
+def videos_daily_via_analytics_only(yta, youtube_opt, *, ids, startDate, endDate, metrics, sort=None) -> pd.DataFrame:
     df = run_report(
         yta,
         ids=ids,
@@ -293,13 +321,28 @@ def videos_daily_via_analytics_only(yta, *, ids, startDate, endDate, metrics, so
         dimensions="video,day",
         sort=sort or "day",
     )
-    if not df.empty and "video" in df.columns:
+    if df.empty:
+        return df
+
+    # 列名整形
+    if "video" in df.columns:
         df = df.rename(columns={"video": "videoId"})
-        cols = list(df.columns)
-        for k in ["videoId", "day"]:
-            if k in cols:
-                cols.remove(k)
-        df = df[["videoId", "day"] + cols]
+    # 可能なら Data API でタイトルを一括取得
+    df.insert(1, "videoTitle", "")  # 仮置き
+    if youtube_opt is not None:
+        try:
+            uniq_ids = sorted(set(df["videoId"].astype(str).tolist()))
+            title_map = get_video_title_map(youtube_opt, uniq_ids)
+            df["videoTitle"] = df["videoId"].map(lambda x: title_map.get(str(x), ""))
+        except Exception as e:
+            print(f"[WARN] タイトル取得に失敗しました（継続します）。詳細: {e}")
+
+    # 列順を videoId, videoTitle, day 先頭へ
+    cols = list(df.columns)
+    for k in ["videoId", "videoTitle", "day"]:
+        if k in cols:
+            cols.remove(k)
+    df = df[["videoId", "videoTitle", "day"] + cols]
     return df
 
 
@@ -307,14 +350,14 @@ def videos_daily_via_analytics_only(yta, *, ids, startDate, endDate, metrics, so
 # CLI / メイン
 # ===============================
 def parse_args():
-    parser = argparse.ArgumentParser(description="YouTube Analytics: 動画×日別レポート出力（reports.json 不要）")
+    parser = argparse.ArgumentParser(description="YouTube Analytics: 動画×日別レポート出力（reports.json 不要、タイトル列付き）")
     parser.add_argument("--start", default=START_DATE_DEFAULT, help="開始日 YYYY-MM-DD（デフォルト：過去90日）")
     parser.add_argument("--end", default=END_DATE_DEFAULT, help="終了日 YYYY-MM-DD（デフォルト：今日）")
     parser.add_argument("--ids", default="channel==MINE", help='対象IDs（例："channel==MINE" または "channel==UCxxxx"）')
     parser.add_argument("--metrics", default=DEFAULT_METRICS, help="カンマ区切りのメトリクス（別名は自動マッピング）")
     parser.add_argument("--sort", default="day,video", help="ソートキー（例：day,video / -day など）")
     parser.add_argument("--reauth", action="store_true", help="強制再認証（token.json を作り直す）")
-    parser.add_argument("--video-ids-file", help="1行1IDの外部動画IDリスト。指定時は Data API を使わずこのリストで処理")
+    parser.add_argument("--video-ids-file", help="1行1IDの外部動画IDリスト。指定時は Data API を使わずこのリストで処理（タイトル取得にはData APIが必要）")
     parser.add_argument("--no-fallback", action="store_true", help="フォールバック（analytics-only）を無効化する")
     return parser.parse_args()
 
@@ -325,22 +368,35 @@ def main():
     start_date = args.start
     end_date = args.end
     ids = args.ids
-    metrics = sanitize_metrics(args.metrics)  # 別名を正規名称へ
+    metrics = sanitize_metrics(args.metrics)
     sort = args.sort
 
     print(f"Fetching data from {start_date} to {end_date}...")
 
-    # 出力ディレクトリ初期化
     reset_out_dir()
 
-    # 認証
     creds = get_credentials(force_reauth=args.reauth)
     yta = build_yt_analytics_service(creds)
 
-    # 外部動画IDリストの指定がある場合（Data API 不要）
+    # Data API（タイトル取得にも使用）を用意（失敗しても継続）
+    youtube_opt = None
+    try:
+        youtube_opt = build_yt_data_service(creds)
+    except Exception as e:
+        print(f"[WARN] YouTube Data API 初期化に失敗しました（タイトル付与はスキップ）。詳細: {e}")
+
+    # 外部動画IDリストの指定がある場合
     if args.video_ids_file:
         video_ids = [line.strip() for line in Path(args.video_ids_file).read_text(encoding="utf-8").splitlines() if line.strip()]
         print(f"外部リストから動画IDを {len(video_ids)} 件読み込みました。日別×動画で集計します…")
+
+        # タイトルマップ（可能なら取得）
+        title_map = {}
+        if youtube_opt is not None:
+            try:
+                title_map = get_video_title_map(youtube_opt, video_ids)
+            except Exception as e:
+                print(f"[WARN] タイトル取得に失敗しました（継続します）。詳細: {e}")
 
         safe_sort = _sanitize_sort_for_day_only(sort)
         dfs = []
@@ -357,17 +413,20 @@ def main():
             )
             if not df.empty:
                 df.insert(0, "videoId", vid)
+                df.insert(1, "videoTitle", title_map.get(vid, ""))  # タイトル
                 dfs.append(df)
             if i % 50 == 0:
                 print(f"  {i} / {len(video_ids)} 本処理…")
 
         merged = pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame(
-            columns=["videoId", "day"] + [m.strip() for m in metrics.split(",")]
+            columns=["videoId", "videoTitle", "day"] + [m.strip() for m in metrics.split(",")]
         )
         if not merged.empty and "day" in merged.columns:
             cols = list(merged.columns)
-            cols.remove("day")
-            merged = merged[["videoId", "day"] + [c for c in cols if c not in ("videoId", "day")]]
+            for k in ["videoId", "videoTitle", "day"]:
+                if k in cols:
+                    cols.remove(k)
+            merged = merged[["videoId", "videoTitle", "day"] + cols]
 
         out_path = OUT_DIR / f'videos_daily_{start_date}_{end_date}.csv'
         merged.to_csv(out_path, index=False, encoding="utf-8")
@@ -375,11 +434,13 @@ def main():
         zip_out_dir()
         return
 
-    # 通常：Data API で動画IDを取得してループ方式
+    # 通常：Data APIで動画IDを取得してループ方式（タイトル付）
     try:
-        yt_data = build_yt_data_service(creds)
+        if youtube_opt is None:
+            # Data API が使えない場合はここで例外にしてフォールバックへ
+            raise RuntimeError("YouTube Data API が利用できません。")
         df = videos_daily_via_loop(
-            yta, yt_data,
+            yta, youtube_opt,
             ids=ids,
             startDate=start_date,
             endDate=end_date,
@@ -389,9 +450,10 @@ def main():
     except Exception as e:
         if args.no_fallback:
             raise
-        print(f"[WARN] 動画IDの取得に失敗しました。フォールバックして Analytics の複合ディメンションで一括取得します。\n詳細: {e}")
+        print(f"[WARN] 動画IDの取得またはループ集計に失敗しました。フォールバックして Analytics の複合ディメンションで一括取得します。\n詳細: {e}")
         df = videos_daily_via_analytics_only(
             yta,
+            youtube_opt,  # タイトル付与のため可能なら渡す
             ids=ids,
             startDate=start_date,
             endDate=end_date,
